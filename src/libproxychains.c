@@ -79,6 +79,7 @@ pthread_once_t init_once = PTHREAD_ONCE_INIT;
 static int init_l = 0;
 
 static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_type * ct);
+inline int populate_proxychain(proxy_data * pd, unsigned int *proxy_count, chain_type * ct, char * buff, int count);
 
 static void* load_sym(char* symname, void* proxyfunc) {
 
@@ -263,9 +264,10 @@ static const char* bool_str(int bool_val) {
 
 /* get configuration from config file */
 static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_type * ct) {
-	int count = 0, port_n = 0, list = 0;
-	char buff[1024], type[1024], host[1024], user[1024];
+	int count = 0, list = 0;
+	char buff[1024], user[1024];
 	char *env;
+	char *env_one_proxy_line;
 	char local_in_addr_port[32];
 	char local_in_addr[32], local_in_port[32], local_netmask[32];
 	FILE *file = NULL;
@@ -285,6 +287,10 @@ static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_typ
         	exit(1);
 	}
 
+	env_one_proxy_line = getenv(PROXYCHAINS_ONE_PROXY_ENV_VAR);
+	if (env_one_proxy_line)
+		count = populate_proxychain(pd, proxy_count, ct, env_one_proxy_line, count);
+
 	env = getenv(PROXYCHAINS_QUIET_MODE_ENV_VAR);
 	if(env && *env == '1')
 		proxychains_quiet_mode = 1;
@@ -292,56 +298,11 @@ static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_typ
 	while(fgets(buff, sizeof(buff), file)) {
 		if(buff[0] != '\n' && buff[strspn(buff, " ")] != '#') {
 			/* proxylist has to come last */
-			if(list) {
+			if(list && !env_one_proxy_line) {
 				if(count >= MAX_CHAIN)
 					break;
 
-				memset(&pd[count], 0, sizeof(proxy_data));
-
-				pd[count].ps = PLAY_STATE;
-				port_n = 0;
-
-				int ret = sscanf(buff, "%s %s %d %s %s", type, host, &port_n, pd[count].user, pd[count].pass);
-				if(ret < 3 || ret == EOF) {
-					if(!proxy_from_string(buff, type, host, &port_n, pd[count].user, pd[count].pass)) {
-						inv:
-						fprintf(stderr, "error: invalid item in proxylist section: %s", buff);
-						exit(1);
-					}
-				}
-
-				memset(&pd[count].ip, 0, sizeof(pd[count].ip));
-				pd[count].ip.is_v6 = !!strchr(host, ':');
-				pd[count].port = htons((unsigned short) port_n);
-				ip_type* host_ip = &pd[count].ip;
-				if(1 != inet_pton(host_ip->is_v6 ? AF_INET6 : AF_INET, host, host_ip->addr.v6)) {
-					if(*ct == STRICT_TYPE && proxychains_resolver && count > 0) {
-						/* we can allow dns hostnames for all but the first proxy in the list if chaintype is strict, as remote lookup can be done */
-						ip_type4 internal_ip = at_get_ip_for_host(host, strlen(host));
-						pd[count].ip.is_v6 = 0;
-						host_ip->addr.v4 = internal_ip;
-						if(internal_ip.as_int == ip_type_invalid.addr.v4.as_int)
-							goto inv_host;
-					} else {
-inv_host:
-						fprintf(stderr, "proxy %s has invalid value or is not numeric\n", host);
-						fprintf(stderr, "non-numeric ips are only allowed under the following circumstances:\n");
-						fprintf(stderr, "chaintype == strict (%s), proxy is not first in list (%s), proxy_dns active (%s)\n\n", bool_str(*ct == STRICT_TYPE), bool_str(count > 0), bool_str(proxychains_resolver));
-						exit(1);
-					}
-				}
-
-				if(!strcmp(type, "http")) {
-					pd[count].pt = HTTP_TYPE;
-				} else if(!strcmp(type, "socks4")) {
-					pd[count].pt = SOCKS4_TYPE;
-				} else if(!strcmp(type, "socks5")) {
-					pd[count].pt = SOCKS5_TYPE;
-				} else
-					goto inv;
-
-				if(port_n)
-					count++;
+				count = populate_proxychain(pd, proxy_count, ct, buff, count);
 			} else {
 				if(strstr(buff, "[ProxyList]")) {
 					list = 1;
@@ -433,6 +394,60 @@ inv_host:
 	*proxy_count = count;
 	proxychains_got_chain_data = 1;
 	PDEBUG("proxy_dns: %s\n", proxychains_resolver ? "ON" : "OFF");
+}
+
+int populate_proxychain(proxy_data * pd, unsigned int *proxy_count, chain_type * ct, char * buff, int count) {
+	int port_n = 0;
+	char type[1024], host[1024];
+
+	memset(&pd[count], 0, sizeof(proxy_data));
+
+	pd[count].ps = PLAY_STATE;
+	port_n = 0;
+
+	int ret = sscanf(buff, "%s %s %d %s %s", type, host, &port_n, pd[count].user, pd[count].pass);
+	if(ret < 3 || ret == EOF) {
+		if(!proxy_from_string(buff, type, host, &port_n, pd[count].user, pd[count].pass)) {
+			inv:
+			fprintf(stderr, "error: invalid item in proxylist section: %s", buff);
+			exit(1);
+		}
+	}
+
+	memset(&pd[count].ip, 0, sizeof(pd[count].ip));
+	pd[count].ip.is_v6 = !!strchr(host, ':');
+	pd[count].port = htons((unsigned short) port_n);
+	ip_type* host_ip = &pd[count].ip;
+	if(1 != inet_pton(host_ip->is_v6 ? AF_INET6 : AF_INET, host, host_ip->addr.v6)) {
+		if(*ct == STRICT_TYPE && proxychains_resolver && count > 0) {
+			/* we can allow dns hostnames for all but the first proxy in the list if chaintype is strict, as remote lookup can be done */
+			ip_type4 internal_ip = at_get_ip_for_host(host, strlen(host));
+			pd[count].ip.is_v6 = 0;
+			host_ip->addr.v4 = internal_ip;
+			if(internal_ip.as_int == ip_type_invalid.addr.v4.as_int)
+				goto inv_host;
+		} else {
+inv_host:
+			fprintf(stderr, "proxy %s has invalid value or is not numeric\n", host);
+			fprintf(stderr, "non-numeric ips are only allowed under the following circumstances:\n");
+			fprintf(stderr, "chaintype == strict (%s), proxy is not first in list (%s), proxy_dns active (%s)\n\n", bool_str(*ct == STRICT_TYPE), bool_str(count > 0), bool_str(proxychains_resolver));
+			exit(1);
+		}
+	}
+
+	if(!strcmp(type, "http")) {
+		pd[count].pt = HTTP_TYPE;
+	} else if(!strcmp(type, "socks4")) {
+		pd[count].pt = SOCKS4_TYPE;
+	} else if(!strcmp(type, "socks5")) {
+		pd[count].pt = SOCKS5_TYPE;
+	} else
+		goto inv;
+
+	if(port_n)
+		count++;
+
+	return count; 
 }
 
 /*******  HOOK FUNCTIONS  *******/
